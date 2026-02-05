@@ -3,12 +3,14 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ESPTelnet.h>
+#include <esp_system.h>
 
 #define d1 5
 #define d2 6
 #define d3 7
 #define d4 10
 #define led_builtin 8
+#define buzzer 21
 
 #define MOTOR_UP 1
 #define MOTOR_DOWN -1
@@ -19,7 +21,7 @@
 #define FULLY_EXPOSED 4
 
 #define FULLY_UP 0
-#define FULLY_DOWN 92700
+#define FULLY_DOWN 86000   // połowa ona to 40 000
 
 const char *ssid = "TP-Link_5235";
 const char *passwd = "MaDaPi16";
@@ -40,15 +42,22 @@ bool force_refresh = false;
 bool do_half_step = true;
 bool control_steps = false;
 bool confirm_position = false;
+bool test = false;
+bool beep = false;
 
 int blid_position = FULLY_CLOSED;
-int delay_time = 2; // 3-4 ms is fine (on full_steps)
+int delay_time = 2;                                  // 3-4 ms is fine (on full_steps)
 int motor_state = MOTOR_STOP;
 int steps_total = FULLY_DOWN;
 int goal = FULLY_UP;
+int buzzer_interval = 300;  // ms
+int test_cycles = 0;
 
 long long int last_time = 0;
 long long int last_recon_time = 0;
+
+int64_t last_test_reset = 0;
+int64_t last_buzzer_check = 0;
 
 std::array <int, 5> full_steps = {{d1, d2, d3, d4, d1}};
 std::array <std::array<int, 2>, 9> half_steps = {{
@@ -75,6 +84,8 @@ void step(bool drection=true, bool half_step=false);
 void reconnect();
 const char* getMQTTState(int state);
 void reset_motor();
+const char* getResetReason();
+
 
 void setup() {
   Serial.begin(115200);
@@ -92,7 +103,7 @@ void setup() {
 
   Serial.printf("\nConnected with WiFi! IP: %s\n", WiFi.localIP().toString().c_str());
 
-  digitalWrite(led_builtin, HIGH); // reverse logic
+  digitalWrite(led_builtin, HIGH);                    // reverse logic
   telnetServer.begin();
 
   mqttClient.setServer(mqtt_server, mqtt_port);
@@ -103,6 +114,8 @@ void setup() {
   pinMode(d2, OUTPUT);
   pinMode(d3, OUTPUT);
   pinMode(d4, OUTPUT);
+
+  pinMode(buzzer, OUTPUT);
 
   ArduinoOTA.begin();
 
@@ -118,9 +131,10 @@ void setup() {
 
 void loop() {                                     // TODO 'up' & 'down' works just fine
   ArduinoOTA.handle();                            // but 'full_close' & 'full_expose' not working
-
+  
   if (!ota_update) {
 
+    // TODO change millis() - last_time... to int64_t now = esp_timer_get_time();
 
     if (!mqttClient.connected() && millis() - last_recon_time > 5000) {
       reconnect();
@@ -137,6 +151,8 @@ void loop() {                                     // TODO 'up' & 'down' works ju
         telnet.print("Telnet client have just connected!\n\r");
         Serial.print("Telnet client have just connected!\n");
         telnet_connected = true;
+
+        telnet.printf("WARNING: \tLast reset reason: %s\n\r", getResetReason());
       
       }
     }
@@ -146,7 +162,7 @@ void loop() {                                     // TODO 'up' & 'down' works ju
       if (control_steps) {
         if (steps_total > goal) {
 
-          step(true, do_half_step);
+          step(false, do_half_step);
 
         } else { 
 
@@ -157,11 +173,12 @@ void loop() {                                     // TODO 'up' & 'down' works ju
           telnet.print("INFO: \tWindow blinder: FULLY_EXPOSED\n\r");
     
           motor_state = MOTOR_STOP;
+          beep = true;
 
           
         }
       } else {
-          step(true, do_half_step);
+          step(false, do_half_step);
       }
     
     } else if (motor_state == MOTOR_DOWN) {
@@ -169,7 +186,7 @@ void loop() {                                     // TODO 'up' & 'down' works ju
       if (control_steps) {
         if (steps_total < goal) {
 
-          step(false, do_half_step);
+          step(true, do_half_step);
 
         } else { 
 
@@ -178,11 +195,13 @@ void loop() {                                     // TODO 'up' & 'down' works ju
           mqttClient.publish(mqtt_topic_pub, "FULLY_CLOSED");
           Serial.print("INFO: \tWindow blinder: FULLY_CLOSED\n");
           telnet.print("INFO: \tWindow blinder: FULLY_CLOSED\n\r");
-          motor_state = MOTOR_STOP;
           
+          motor_state = MOTOR_STOP;
+          beep = true;
+
         }
       } else {
-          step(false, do_half_step);
+          step(true, do_half_step);
       }
     
     } else if (motor_state == MOTOR_STOP) {
@@ -190,9 +209,35 @@ void loop() {                                     // TODO 'up' & 'down' works ju
     }
 
     if (steps_total % 1000 < 20 && confirm_position) {
-      mqttClient.publish(mqtt_topic_steps, std::to_string(steps_total).c_str());
+      mqttClient.publish(mqtt_topic_steps, std::to_string(steps_total).c_str(), true);
       confirm_position = false;
     }
+    //    TESTING
+    if (test && motor_state == MOTOR_STOP && beep) {
+      beep = false;
+
+      digitalWrite(buzzer, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(200));
+      digitalWrite(buzzer, LOW);
+
+      Serial.printf("INFO: \tTEST CYCLE: %i\n", ++test_cycles);
+      telnet.printf("INFO: \tTEST CYCLE: %i\n\r", test_cycles);
+
+
+      vTaskDelay(pdMS_TO_TICKS(5000));
+
+
+      if (steps_total > 84000) {
+        motor_state = MOTOR_UP;
+        goal = FULLY_UP;
+
+      } else if (steps_total < 1000) {
+        motor_state = MOTOR_DOWN;
+        goal = FULLY_DOWN;
+      }
+      
+    }
+    
 
   }
 
@@ -275,7 +320,7 @@ void callback(char *topic, byte *payload, unsigned int length) {
 
     if (msg == "up") {
 
-      motor_state = -1;
+      motor_state = MOTOR_UP; 
       control_steps = false;
       blid_position = UNKNOWN;
 
@@ -284,7 +329,7 @@ void callback(char *topic, byte *payload, unsigned int length) {
 
     } else if (msg == "down") {
 
-      motor_state = 1;
+      motor_state = MOTOR_DOWN;
       control_steps = false;
       blid_position = UNKNOWN;
 
@@ -294,7 +339,7 @@ void callback(char *topic, byte *payload, unsigned int length) {
     } else if (msg == "stop") {         // TODO if u manually controll stepper motor, 
                                         // position would be unprecise and full_close / full_expose
                                         // might not work properly
-      motor_state = 0;                  
+      motor_state = MOTOR_STOP;                  
       control_steps = false;
       blid_position = UNKNOWN;
 
@@ -324,7 +369,7 @@ void callback(char *topic, byte *payload, unsigned int length) {
       telnet.print("INFO: \tWindow blinder: HALF_STEP\n\r");
     } else if (msg == "full_close") {
 
-      motor_state = 1;
+      motor_state = MOTOR_DOWN;
       control_steps = true;
       goal = FULLY_DOWN;
 
@@ -333,12 +378,40 @@ void callback(char *topic, byte *payload, unsigned int length) {
 
     } else if (msg == "full_expose") {
 
-      motor_state = -1;
+      motor_state = MOTOR_UP;
       control_steps = true;
       goal = FULLY_UP;
 
       Serial.print("INFO: \tWindow blinder: GOING FULLY UP\n");
       telnet.print("INFO: \tWindow blinder: GOING FULLY UP\n\r");
+
+
+
+
+    } else if (msg == "test") {
+
+
+      test = true;
+
+      if (steps_total == FULLY_DOWN) {
+        motor_state = MOTOR_UP;
+        control_steps = true;
+        goal = FULLY_UP;
+
+      } else if (steps_total = FULLY_UP) {
+        motor_state = MOTOR_UP;
+        control_steps = true;
+        goal = FULLY_UP;
+      }
+
+
+      Serial.print("INFO: \tWindow blinder: MAKING TESTS...\n");
+      telnet.print("INFO: \tWindow blinder: MAKING TESTS...\n\r");
+
+
+
+
+
 
     } else {
 
@@ -394,5 +467,17 @@ const char* getMQTTState(int state) {
         case  4: return "MQTT_CONNECT_BAD_CREDENTIALS";
         case  5: return "MQTT_CONNECT_UNAUTHORIZED";
         default: return "Unknown type";
+    }
+}
+
+const char* getResetReason() {
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON: return "Power on reset";
+        case ESP_RST_SW:      return "Software reset";
+        case ESP_RST_PANIC:   return "Exception / Panic reset";
+        case ESP_RST_INT_WDT: return "Interrupt Watchdog";
+        case ESP_RST_TASK_WDT:return "Task Watchdog";
+        case ESP_RST_BROWNOUT:return "Brownout (voltage dip)";
+        default:              return "Other";
     }
 }
