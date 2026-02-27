@@ -5,23 +5,24 @@
 #include <ESPTelnet.h>
 #include <esp_system.h>
 
-#define d1 5
-#define d2 6
-#define d3 7
-#define d4 10
+#define d1 10    // TODO sprawdzic piny
+#define d2 5
+#define d3 6
+#define d4 7
 #define led_builtin 8
-#define buzzer 21
 
 #define MOTOR_UP 1
 #define MOTOR_DOWN -1
 #define MOTOR_STOP 0
 
 #define FULLY_CLOSED 2
-#define UNKNOWN 3
+#define UNKNOWN_POS 3
 #define FULLY_EXPOSED 4
 
 #define FULLY_UP 0
-#define FULLY_DOWN 86000   // połowa ona to 40 000
+#define HALF_OPENED 40000
+#define FULLY_DOWN 86000   // połowa okna to 40 000
+
 
 const char *ssid = "TP-Link_5235";
 const char *passwd = "MaDaPi16";
@@ -34,30 +35,25 @@ const char *mqtt_topic_pub = "window_roller/state";
 const char *mqtt_topic_steps = "window_roller/step";
 const char *mqtt_topic_sub = "window_roller/motor";
 
+// Font colors
+const char* CLR_RST = "\033[0m";
+const char* CLR_RED = "\033[31m";
+const char* CLR_GRN = "\033[32m";
+const char* CLR_YLW = "\033[33m";
+
 const int telnet_port = 23;
 
 bool ota_update = false;
-bool telnet_connected = false;
-bool force_refresh = false;
-bool do_half_step = true;
 bool control_steps = false;
 bool confirm_position = false;
-bool test = false;
-bool beep = false;
 
 int blid_position = FULLY_CLOSED;
-int delay_time = 2;                                  // 3-4 ms is fine (on full_steps)
-int motor_state = MOTOR_STOP;
+const int delay_time = 2;                                  // 3-4 ms is fine on full_steps
+int motor_state = MOTOR_STOP;                        // or 2 ms on half_steps
 int steps_total = FULLY_DOWN;
 int goal = FULLY_UP;
-int buzzer_interval = 300;  // ms
-int test_cycles = 0;
 
-long long int last_time = 0;
-long long int last_recon_time = 0;
-
-int64_t last_test_reset = 0;
-int64_t last_buzzer_check = 0;
+int64_t last_recon_time = 0;
 
 std::array <int, 5> full_steps = {{d1, d2, d3, d4, d1}};
 std::array <std::array<int, 2>, 9> half_steps = {{
@@ -71,7 +67,6 @@ std::array <std::array<int, 2>, 9> half_steps = {{
                               {d1, d4},
                               {d1, -1}
                             }};
-                            
 
 WiFiServer telnetServer(telnet_port);
 WiFiClient telnet;
@@ -80,14 +75,15 @@ WiFiClient client;
 PubSubClient mqttClient(client);
 
 void callback(char *topic, byte *payload, unsigned int length);
-void step(bool drection=true, bool half_step=false);
+void step(bool drection=true);
 void reconnect();
 const char* getMQTTState(int state);
-void reset_motor();
+void stop_motor();
 const char* getResetReason();
 
 
 void setup() {
+
   Serial.begin(115200);
   pinMode(led_builtin, OUTPUT);
 
@@ -101,7 +97,8 @@ void setup() {
 
   }
 
-  Serial.printf("\nConnected with WiFi! IP: %s\n", WiFi.localIP().toString().c_str());
+  Serial.print("\nConnected with WiFi! IP: ");
+  Serial.println(WiFi.localIP()); 
 
   digitalWrite(led_builtin, HIGH);                    // reverse logic
   telnetServer.begin();
@@ -115,8 +112,6 @@ void setup() {
   pinMode(d3, OUTPUT);
   pinMode(d4, OUTPUT);
 
-  pinMode(buzzer, OUTPUT);
-
   ArduinoOTA.begin();
 
   ArduinoOTA.onStart([]() {
@@ -129,146 +124,99 @@ void setup() {
 
 }
 
-void loop() {                                     // TODO 'up' & 'down' works just fine
-  ArduinoOTA.handle();                            // but 'full_close' & 'full_expose' not working
+void loop() {                                   
+  ArduinoOTA.handle();
   
   if (!ota_update) {
 
-    // TODO change millis() - last_time... to int64_t now = esp_timer_get_time();
+    int64_t now = esp_timer_get_time();
 
-    if (!mqttClient.connected() && millis() - last_recon_time > 5000) {
-      reconnect();
-      last_recon_time = millis();
+    if (!mqttClient.connected() && now - last_recon_time > 5000000) { //   5sec
+      reconnect(); 
+      last_recon_time = now;
     }
 
     mqttClient.loop();
 
-    if ((!telnet || !telnet.connected()) && !telnet_connected) {
+    if (!telnet || !telnet.connected()) {
       
       telnet = telnetServer.accept();      
       if (telnet) {
       
-        telnet.print("Telnet client have just connected!\n\r");
-        Serial.print("Telnet client have just connected!\n");
-        telnet_connected = true;
+        telnet.printf("INFO: \tTelnet client have just %sconnected!%s\n\r", CLR_GRN, CLR_RST);
+        Serial.print("INFO: \tTelnet client have just connected!\n");
 
-        telnet.printf("WARNING: \tLast reset reason: %s\n\r", getResetReason());
+        telnet.printf("%sWARNING%s: \tLast reset reason: %s%s%s\n\r",
+          CLR_YLW, CLR_RST, CLR_YLW, getResetReason(), CLR_RST);
       
       }
     }
 
+    while (telnet && telnet.available()) telnet.read();
+
     if (motor_state == MOTOR_UP) {
 
-      if (control_steps) {
-        if (steps_total > goal) {
+      step(false);
+      
+      if (control_steps && steps_total <= goal) {
 
-          step(false, do_half_step);
+        mqttClient.publish(mqtt_topic_pub, "FULLY_EXPOSED");
 
-        } else { 
+        telnet.printf("INFO: \tWindow blinder: %sFULLY_EXPOSED%s\n\r", CLR_GRN, CLR_RST);
+        
+        blid_position = FULLY_EXPOSED;
+        motor_state = MOTOR_STOP;
+        stop_motor();
 
-          blid_position = FULLY_EXPOSED;
-
-          mqttClient.publish(mqtt_topic_pub, "FULLY_EXPOSED");
-          Serial.print("INFO: \tWindow blinder: FULLY_EXPOSED\n");
-          telnet.print("INFO: \tWindow blinder: FULLY_EXPOSED\n\r");
-    
-          motor_state = MOTOR_STOP;
-          beep = true;
-
-          
-        }
-      } else {
-          step(false, do_half_step);
       }
     
     } else if (motor_state == MOTOR_DOWN) {
         
-      if (control_steps) {
-        if (steps_total < goal) {
+      step(true);
 
-          step(true, do_half_step);
-
-        } else { 
-
-          blid_position = FULLY_CLOSED;
-
-          mqttClient.publish(mqtt_topic_pub, "FULLY_CLOSED");
-          Serial.print("INFO: \tWindow blinder: FULLY_CLOSED\n");
-          telnet.print("INFO: \tWindow blinder: FULLY_CLOSED\n\r");
+      if (control_steps && steps_total >= goal) {
           
-          motor_state = MOTOR_STOP;
-          beep = true;
+        mqttClient.publish(mqtt_topic_pub, "FULLY_CLOSED");
 
-        }
-      } else {
-          step(true, do_half_step);
+        telnet.printf("INFO: \tWindow blinder: %sFULLY_CLOSED%s\n\r", CLR_GRN, CLR_RST);
+        
+        blid_position = FULLY_CLOSED;
+        motor_state = MOTOR_STOP;
+        stop_motor();
+
       }
     
     } else if (motor_state == MOTOR_STOP) {
-      reset_motor();
+      stop_motor();
     }
 
     if (steps_total % 1000 < 20 && confirm_position) {
+      
       mqttClient.publish(mqtt_topic_steps, std::to_string(steps_total).c_str(), true);
+      
       confirm_position = false;
     }
-    //    TESTING
-    if (test && motor_state == MOTOR_STOP && beep) {
-      beep = false;
-
-      digitalWrite(buzzer, HIGH);
-      vTaskDelay(pdMS_TO_TICKS(200));
-      digitalWrite(buzzer, LOW);
-
-      Serial.printf("INFO: \tTEST CYCLE: %i\n", ++test_cycles);
-      telnet.printf("INFO: \tTEST CYCLE: %i\n\r", test_cycles);
-
-
-      vTaskDelay(pdMS_TO_TICKS(5000));
-
-
-      if (steps_total > 84000) {
-        motor_state = MOTOR_UP;
-        goal = FULLY_UP;
-
-      } else if (steps_total < 1000) {
-        motor_state = MOTOR_DOWN;
-        goal = FULLY_DOWN;
-      }
-      
-    }
-    
 
   }
 
 }
 
 
-void step(bool direction, bool go_half_step) {   // TODO: maybe split it to 2 functions
+void step(bool direction) {
   confirm_position = true;
 
-  int length = full_steps.size();
-  if (go_half_step) length = half_steps.size();
+  int length = half_steps.size();
 
   if (direction) {
 
     for (int i=1; i<length; i++) {
-      if (go_half_step) {
+ 
+      digitalWrite(half_steps[i-1][0], LOW);
+      if (half_steps[i-1][1] != -1) digitalWrite(half_steps[i-1][1], LOW);
 
-        digitalWrite(half_steps[i-1][0], LOW);
-        if (half_steps[i-1][1] != -1) digitalWrite(half_steps[i-1][1], LOW);
-
-        digitalWrite(half_steps[i][0], HIGH);
-        if (half_steps[i][1] != -1) digitalWrite(half_steps[i][1], HIGH);
-
-
-      } else {
-
-        digitalWrite(full_steps[i-1], LOW);
-        digitalWrite(full_steps[i], HIGH);
-      
-      }
-      
+      digitalWrite(half_steps[i][0], HIGH);
+      if (half_steps[i][1] != -1) digitalWrite(half_steps[i][1], HIGH);
+     
       steps_total ++;
       vTaskDelay(pdMS_TO_TICKS(delay_time));
 
@@ -278,20 +226,11 @@ void step(bool direction, bool go_half_step) {   // TODO: maybe split it to 2 fu
 
     for (int i = (length - 2); i >= 0; i--) {
 
-      if (go_half_step) {
+      digitalWrite(half_steps[i+1][0], LOW);
+      if (half_steps[i+1][1] != -1) digitalWrite(half_steps[i+1][1], LOW);
 
-        digitalWrite(half_steps[i+1][0], LOW);
-        if (half_steps[i+1][1] != -1) digitalWrite(half_steps[i+1][1], LOW);
-
-        digitalWrite(half_steps[i][0], HIGH);
-        if (half_steps[i][1] != -1) digitalWrite(half_steps[i][1], HIGH);
-
-      } else {
-
-        digitalWrite(full_steps[i+1], LOW);
-        digitalWrite(full_steps[i], HIGH);
-
-      }
+      digitalWrite(half_steps[i][0], HIGH);
+      if (half_steps[i][1] != -1) digitalWrite(half_steps[i][1], HIGH);
 
       steps_total --;
       vTaskDelay(pdMS_TO_TICKS(delay_time));
@@ -301,7 +240,7 @@ void step(bool direction, bool go_half_step) {   // TODO: maybe split it to 2 fu
   }
 }
 
-void reset_motor() {
+void stop_motor() {
   digitalWrite(d1, LOW);
   digitalWrite(d2, LOW);
   digitalWrite(d3, LOW);
@@ -312,68 +251,58 @@ void callback(char *topic, byte *payload, unsigned int length) {
 
   String msg;
 
-  for (int i=0; i<length; i++) {
+  for (uint i=0; i<length; i++) {
     msg += (char)payload[i];
   }
 
   if (String(topic) == mqtt_topic_sub) {
 
+    //                    GOING UP (manually)
     if (msg == "up") {
 
       motor_state = MOTOR_UP; 
       control_steps = false;
-      blid_position = UNKNOWN;
+      blid_position = UNKNOWN_POS;
 
-      Serial.print("INFO: \tWindow blinder: UP\n");
-      telnet.print("INFO: \tWindow blinder: UP\n\r");
+      telnet.printf("INFO: \tWindow blinder: %sUP%s\n\r", CLR_GRN, CLR_RST);
 
+      telnet.printf("%sWARNING%s: \tYou migt recalibrate motor. When window is fully closed or \
+        fully opened, use %s\"SET_CLOSED\"%s or %s\"SET_OPENED\"%s.\n\r", 
+        CLR_YLW, CLR_RST, CLR_YLW, CLR_RST, CLR_YLW, CLR_RST);
+
+
+    //                    GOING DOWN (manually)
     } else if (msg == "down") {
 
       motor_state = MOTOR_DOWN;
       control_steps = false;
-      blid_position = UNKNOWN;
+      blid_position = UNKNOWN_POS;
 
-      Serial.print("INFO: \tWindow blinder: DOWN\n");
-      telnet.print("INFO: \tWindow blinder: DOWN\n\r");
+      telnet.printf("INFO: \tWindow blinder: %sDOWN%s\n\r", CLR_GRN, CLR_RST);
 
-    } else if (msg == "stop") {         // TODO if u manually controll stepper motor, 
-                                        // position would be unprecise and full_close / full_expose
-                                        // might not work properly
+      telnet.printf("%sWARNING%s: \tYou migt recalibrate motor. When window is fully closed or \
+        fully opened, use %s\"SET_CLOSED\"%s or %s\"SET_OPENED\"%s.\n\r", 
+        CLR_YLW, CLR_RST, CLR_YLW, CLR_RST, CLR_YLW, CLR_RST);
+
+    //                    STOP (manually)
+    } else if (msg == "stop") {
+
       motor_state = MOTOR_STOP;                  
       control_steps = false;
-      blid_position = UNKNOWN;
+      blid_position = UNKNOWN_POS;
 
-      Serial.print("INFO: \tWindow blinder: STOP\t\t");
-      telnet.print("INFO: \tWindow blinder: STOP\t\t");
+      telnet.printf("INFO: \tWindow blinder: %sSTOP%s\n\r", CLR_RED, CLR_RST);
 
-      Serial.printf("Steps made: %i\n", steps_total);
-      telnet.printf("Steps made: %i\n\r", steps_total);
+      telnet.printf("%sWARNING%s: \tYou migt recalibrate motor. When window is fully closed or \
+        fully opened, use %s\"SET_CLOSED\"%s or %s\"SET_OPENED\"%s.\n\r", 
+        CLR_YLW, CLR_RST, CLR_YLW, CLR_RST, CLR_YLW, CLR_RST);
 
-
-    } else if (msg == "full_step") {
-
-      do_half_step = false;
-      delay_time = 4;
-      control_steps = false;
-      
-      Serial.print("INFO: \tWindow blinder: FULL_STEP\n");
-      telnet.print("INFO: \tWindow blinder: FULL_STEP\n\r");
-
-    } else if (msg == "half_step") {
-
-      do_half_step = true;
-      delay_time = 2;
-      control_steps = false;
-
-      Serial.print("INFO: \tWindow blinder: HALF_STEP\n");
-      telnet.print("INFO: \tWindow blinder: HALF_STEP\n\r");
     } else if (msg == "full_close") {
 
       motor_state = MOTOR_DOWN;
       control_steps = true;
       goal = FULLY_DOWN;
 
-      Serial.print("INFO: \tWindow blinder: GOING FULLY DOWN\n");
       telnet.print("INFO: \tWindow blinder: GOING FULLY DOWN\n\r");
 
     } else if (msg == "full_expose") {
@@ -382,41 +311,31 @@ void callback(char *topic, byte *payload, unsigned int length) {
       control_steps = true;
       goal = FULLY_UP;
 
-      Serial.print("INFO: \tWindow blinder: GOING FULLY UP\n");
       telnet.print("INFO: \tWindow blinder: GOING FULLY UP\n\r");
 
+    } else if (msg == "help") {
 
+      telnet.printf("Commands:\n\r");
 
+      telnet.printf("\t%sup%s: \twindow roller will go up until you send %sstop%s command.\n\r", 
+        CLR_GRN, CLR_RST, CLR_RED, CLR_RST);
 
-    } else if (msg == "test") {
+      telnet.printf("\t%sdown%s: \twindow roller will go down until you send %sstop%s command.\n\r", 
+        CLR_GRN, CLR_RST, CLR_RED, CLR_RST);
 
+      telnet.printf("\t%sstop%s: \twindow roller should %sstop%s no matter what.\n\r", 
+        CLR_RED, CLR_RST, CLR_RED, CLR_RST);
 
-      test = true;
+      telnet.printf("\t%sfull_close%s: \twindow roller will go down until it cover entire window.\n\r", 
+        CLR_GRN, CLR_RST, CLR_RED, CLR_RST);
 
-      if (steps_total == FULLY_DOWN) {
-        motor_state = MOTOR_UP;
-        control_steps = true;
-        goal = FULLY_UP;
+      telnet.printf("\t%sfull_expose%s: \twindow roller will go up until it expose entire window.\n\r", 
+        CLR_GRN, CLR_RST, CLR_RED, CLR_RST);
 
-      } else if (steps_total = FULLY_UP) {
-        motor_state = MOTOR_UP;
-        control_steps = true;
-        goal = FULLY_UP;
-      }
-
-
-      Serial.print("INFO: \tWindow blinder: MAKING TESTS...\n");
-      telnet.print("INFO: \tWindow blinder: MAKING TESTS...\n\r");
-
-
-
-
-
-
+      telnet.print("\n\n\r");
     } else {
 
-      telnet.printf("WARNING: \tUnexpected msg received: %s \n\r", msg.c_str());
-      Serial.printf("WARNING: \tUnexpected msg received: %s \n", msg.c_str());
+      telnet.printf("%sWARNING%s: \tUnexpected msg received: %s \n\r", CLR_YLW, CLR_RST, msg.c_str());
     }
   }
 
@@ -426,13 +345,14 @@ void reconnect() {
 
   bool connected = false;
 
-  Serial.print("INFO: \tReconnecting with MQTT broker... ");
-  telnet.print("INFO: \tReconnecting with MQTT broker... ");
+  Serial.print("WARNING: \tReconnecting with MQTT broker...\n");
+  telnet.printf("%sWARNING%s: \tReconnecting with MQTT broker...\n\r", CLR_YLW, CLR_RST);
 
 
-  if (mqttClient.connect("window_roller", mqtt_user, mqtt_passwd)) {
+  if (mqttClient.connect("window_blinder", mqtt_user, mqtt_passwd)) {
     Serial.print("Connected!\n");
-    telnet.print("Connected!\n\r");
+    telnet.printf("%sConnected!%s\n\r", CLR_GRN, CLR_RST);
+    
     connected = true;
 
     mqttClient.subscribe(mqtt_topic_sub);
@@ -440,7 +360,8 @@ void reconnect() {
   } else {
     
     Serial.printf("Error: \t%s\n", getMQTTState(mqttClient.state()) );
-    telnet.printf("Error: \t%s\n\r", getMQTTState(mqttClient.state()) );
+    telnet.printf("%sError%s: \t%s%s%s\n\r", 
+      CLR_RED, CLR_RST, CLR_RED, getMQTTState(mqttClient.state()), CLR_RST);
 
   }
   
